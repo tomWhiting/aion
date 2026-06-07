@@ -112,15 +112,13 @@ async fn current_head_outside_transaction(
 }
 
 fn validate_contiguous(events: &[Event], expected_seq: u64) -> Result<(), StoreError> {
-    let mut next_seq = expected_seq + 1;
-    for event in events {
+    for (next_seq, event) in (expected_seq + 1..).zip(events) {
         if event.seq() != next_seq {
             return Err(StoreError::Backend(format!(
                 "event sequence must be contiguous: expected {next_seq}, got {}",
                 event.seq()
             )));
         }
-        next_seq += 1;
     }
 
     Ok(())

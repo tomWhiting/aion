@@ -15,6 +15,7 @@ thiserror = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 serde_json.workspace = true
 uuid = { workspace = true }
+futures.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
