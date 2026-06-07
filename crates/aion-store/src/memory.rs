@@ -121,15 +121,13 @@ impl EventStore for InMemoryStore {
             return Ok(());
         }
 
-        let mut next_seq = expected_seq + 1;
-        for event in events {
-            if event.seq() != next_seq {
+        for (event, expected_seq) in events.iter().zip((expected_seq + 1)..) {
+            if event.seq() != expected_seq {
                 return Err(StoreError::Backend(format!(
-                    "event sequence must be contiguous: expected {next_seq}, got {}",
+                    "event sequence must be contiguous: expected {expected_seq}, got {}",
                     event.seq()
                 )));
             }
-            next_seq += 1;
         }
 
         state

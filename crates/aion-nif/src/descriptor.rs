@@ -134,6 +134,9 @@ mod tests {
         assert_eq!(nif.arity(), 1);
         assert!(!nif.is_dirty());
         assert_eq!(nif.determinism(), Determinism::Pure);
-        assert_eq!(nif.native() as usize, identity_native as usize);
+        assert_eq!(
+            nif.native() as *const () as usize,
+            identity_native as *const () as usize
+        );
     }
 }
