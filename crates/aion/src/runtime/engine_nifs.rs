@@ -8,9 +8,9 @@ use std::cell::RefCell;
 
 use beamr::atom::Atom;
 use beamr::native::ProcessContext;
-use beamr::term::Term;
 use beamr::term::binary::{self, Binary};
 use beamr::term::boxed;
+use beamr::term::Term;
 
 use crate::activity::bridge::activity_dispatcher;
 
@@ -124,11 +124,11 @@ pub(super) fn engine_nif_entries() -> Vec<NifEntry> {
 #[cfg(test)]
 mod tests {
     use beamr::native::ProcessContext;
-    use beamr::term::Term;
     use beamr::term::binary::Binary;
     use beamr::term::boxed::Tuple;
+    use beamr::term::Term;
 
-    use super::{alloc_binary_term, clear_parked_heap, run_activity};
+    use super::{alloc_binary_term, clear_parked_heap, engine_nif_entries, run_activity};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -155,10 +155,46 @@ mod tests {
     }
 
     #[test]
+    fn engine_nif_entries_match_expected_registrations() {
+        let expected = [("aion_flow_ffi", "run_activity", 3_u8)];
+        let actual = engine_nif_entries();
+
+        for (expected_module, expected_function, expected_arity) in expected {
+            let matching_function = actual.iter().find(|entry| {
+                entry.mfa.module == expected_module && entry.mfa.function == expected_function
+            });
+            let Some(entry) = matching_function else {
+                panic!(
+                    "missing expected NIF {expected_module}:{expected_function}/{expected_arity}"
+                );
+            };
+
+            assert_eq!(
+                entry.mfa.arity, expected_arity,
+                "wrong arity for NIF {expected_module}:{expected_function}: expected {expected_arity}, got {}",
+                entry.mfa.arity
+            );
+        }
+
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "registered engine NIF count differs from expected list: expected {}, got {}. actual registrations: {}",
+            expected.len(),
+            actual.len(),
+            actual
+                .iter()
+                .map(|entry| entry.mfa.display())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    #[test]
     fn returns_result_tuple_for_valid_call() -> TestResult {
         use std::sync::Arc;
 
-        use crate::activity::bridge::{ActivityDispatcher, install_activity_dispatcher};
+        use crate::activity::bridge::{install_activity_dispatcher, ActivityDispatcher};
 
         struct TestDispatcher;
         impl ActivityDispatcher for TestDispatcher {
