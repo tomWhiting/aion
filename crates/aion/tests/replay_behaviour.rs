@@ -484,6 +484,153 @@ async fn fully_recorded_history_replays_to_terminal_with_zero_live_calls()
 }
 
 #[tokio::test]
+async fn recover_realistic_multi_event_workflow_to_resume_live()
+-> Result<(), Box<dyn std::error::Error>> {
+    let store: Arc<dyn EventStore> = Arc::new(InMemoryStore::default());
+    let workflow_id = workflow_id();
+    let mut recorder = Recorder::new(workflow_id.clone(), Arc::clone(&store));
+    let activity_id = ActivityId::from_sequence_position(0);
+    let timer_id = TimerId::anonymous(4);
+    let resume_command = activity_command(1)?;
+
+    recorder
+        .record_workflow_started(
+            timestamp(10)?,
+            "workflow".to_owned(),
+            payload("input")?,
+            aion_core::RunId::new(uuid::Uuid::from_u128(1)),
+        )
+        .await?;
+    recorder
+        .record_activity_scheduled(
+            timestamp(20)?,
+            activity_id.clone(),
+            "activity".to_owned(),
+            payload("activity-input")?,
+        )
+        .await?;
+    recorder
+        .record_activity_completed(timestamp(30)?, activity_id, payload("activity-result")?)
+        .await?;
+    recorder
+        .record_signal_received(
+            timestamp(40)?,
+            "ready".to_owned(),
+            payload("signal-payload")?,
+        )
+        .await?;
+    recorder
+        .record_timer_started(timestamp(50)?, timer_id.clone(), timestamp(100)?)
+        .await?;
+    recorder
+        .record_timer_fired(timestamp(60)?, timer_id.clone())
+        .await?;
+    recorder
+        .record_child_workflow_started(
+            timestamp(70)?,
+            child_workflow_id(),
+            "child".to_owned(),
+            payload("child-input")?,
+        )
+        .await?;
+    recorder
+        .record_child_workflow_completed(
+            timestamp(80)?,
+            child_workflow_id(),
+            payload("child-result")?,
+        )
+        .await?;
+
+    let history = store.read_history(&workflow_id).await?;
+    assert_eq!(history.len(), 8);
+    assert!(matches!(history[0], Event::WorkflowStarted { .. }));
+    assert!(matches!(history[1], Event::ActivityScheduled { .. }));
+    assert!(matches!(history[2], Event::ActivityCompleted { .. }));
+    assert!(matches!(history[3], Event::SignalReceived { .. }));
+    assert!(matches!(history[4], Event::TimerStarted { .. }));
+    assert!(matches!(history[5], Event::TimerFired { .. }));
+    assert!(matches!(history[6], Event::ChildWorkflowStarted { .. }));
+    assert!(matches!(history[7], Event::ChildWorkflowCompleted { .. }));
+    assert!(!history.iter().any(|event| {
+        matches!(
+            event,
+            Event::WorkflowCompleted { .. }
+                | Event::WorkflowFailed { .. }
+                | Event::WorkflowCancelled { .. }
+                | Event::WorkflowTimedOut { .. }
+                | Event::WorkflowContinuedAsNew { .. }
+        )
+    }));
+
+    let active = store.list_active().await?;
+    assert_eq!(active, vec![workflow_id.clone()]);
+
+    let child_start_seq = history[6].seq();
+    let commands = vec![
+        activity_command(0)?,
+        signal_command("ready", 0),
+        timer_command(timer_id.clone())?,
+        child_command(child_start_seq)?,
+        resume_command.clone(),
+    ];
+    let expected_recorded = vec![
+        Resolution::ActivityCompleted(payload("activity-result")?),
+        Resolution::SignalDelivered(payload("signal-payload")?),
+        Resolution::TimerFired,
+        Resolution::ChildCompleted(payload("child-result")?),
+    ];
+
+    let mut direct_replay = Replay::new(&workflow_id, &run_id(), history.clone())?;
+    assert_eq!(
+        direct_replay.drive(commands.clone())?,
+        ReplayOutcome::ResumeLive {
+            command_index: 4,
+            command: resume_command.clone(),
+            recorded: expected_recorded.clone(),
+        }
+    );
+
+    let mut driver = StaticRecoveryDriver::default();
+    driver.insert(workflow_id.clone(), commands)?;
+    let executor = CountingExecutor::default();
+
+    let report = recover(Arc::clone(&store), &executor, &driver).await?;
+
+    assert_eq!(report.len(), 1);
+    assert_eq!(report[0].workflow_id, workflow_id);
+    match &report[0].outcome {
+        RecoveryOutcome::Resumed {
+            resume_point,
+            recorded,
+        } => {
+            assert_eq!(resume_point.command_index, 4);
+            assert_eq!(resume_point.command, resume_command);
+            assert_eq!(resume_point.head, 8);
+            assert_eq!(recorded, &expected_recorded);
+        }
+        other => return Err(format!("expected realistic workflow to resume, got {other:?}").into()),
+    }
+    assert_eq!(executor.calls(), 0);
+
+    let mut resumed_recorder = Recorder::resume_at(workflow_id.clone(), Arc::clone(&store), 8);
+    resumed_recorder
+        .record_activity_scheduled(
+            timestamp(90)?,
+            ActivityId::from_sequence_position(1),
+            "activity".to_owned(),
+            payload("activity-input")?,
+        )
+        .await?;
+    let recovered_history = store.read_history(&workflow_id).await?;
+    let appended = recovered_history
+        .last()
+        .ok_or("recovered history should contain appended event")?;
+    assert_eq!(appended.seq(), 9);
+    assert!(matches!(appended, Event::ActivityScheduled { .. }));
+    Ok(())
+}
+
+#[tokio::test]
 async fn recover_replays_only_active_workflows_to_resume_points()
 -> Result<(), Box<dyn std::error::Error>> {
     let store: Arc<dyn EventStore> = Arc::new(InMemoryStore::default());
