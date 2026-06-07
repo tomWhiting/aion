@@ -356,6 +356,159 @@ mod tests {
         );
     }
 
+    #[test]
+    fn workflow_type_filter_matches_exact_type_and_rejects_mismatch() {
+        let summary = workflow_summary();
+
+        let matching = ListWorkflowsFilter {
+            workflow_type: Some(String::from("example")),
+            ..ListWorkflowsFilter::default()
+        };
+        let non_matching = ListWorkflowsFilter {
+            workflow_type: Some(String::from("other")),
+            ..ListWorkflowsFilter::default()
+        };
+
+        assert!(matching.matches(&summary));
+        assert!(!non_matching.matches(&summary));
+    }
+
+    #[test]
+    fn status_filter_matches_exact_status_and_rejects_mismatch() {
+        let summary = workflow_summary();
+
+        let matching = ListWorkflowsFilter {
+            status: Some(WorkflowStatus::Running),
+            ..ListWorkflowsFilter::default()
+        };
+        let non_matching = ListWorkflowsFilter {
+            status: Some(WorkflowStatus::Completed),
+            ..ListWorkflowsFilter::default()
+        };
+
+        assert!(matching.matches(&summary));
+        assert!(!non_matching.matches(&summary));
+    }
+
+    #[test]
+    fn started_after_filter_matches_boundary_and_rejects_earlier() {
+        let summary = workflow_summary();
+        let start = summary.start_time;
+
+        let at_boundary = ListWorkflowsFilter {
+            started_after: Some(start),
+            ..ListWorkflowsFilter::default()
+        };
+        let after_start = ListWorkflowsFilter {
+            started_after: Some(start + chrono::Duration::seconds(1)),
+            ..ListWorkflowsFilter::default()
+        };
+
+        assert!(at_boundary.matches(&summary));
+        assert!(!after_start.matches(&summary));
+    }
+
+    #[test]
+    fn started_before_filter_matches_boundary_and_rejects_later() {
+        let summary = workflow_summary();
+        let start = summary.start_time;
+
+        let at_boundary = ListWorkflowsFilter {
+            started_before: Some(start),
+            ..ListWorkflowsFilter::default()
+        };
+        let before_start = ListWorkflowsFilter {
+            started_before: Some(start - chrono::Duration::seconds(1)),
+            ..ListWorkflowsFilter::default()
+        };
+
+        assert!(at_boundary.matches(&summary));
+        assert!(!before_start.matches(&summary));
+    }
+
+    #[test]
+    fn closed_after_filter_does_not_match_running_workflows() {
+        let summary = workflow_summary();
+        assert!(summary.close_time.is_none());
+
+        let filter = ListWorkflowsFilter {
+            closed_after: Some(DateTime::<Utc>::default()),
+            ..ListWorkflowsFilter::default()
+        };
+        assert!(!filter.matches(&summary));
+    }
+
+    #[test]
+    fn closed_after_filter_matches_closed_workflow_at_boundary() {
+        let close_time = DateTime::<Utc>::default() + chrono::Duration::hours(1);
+        let summary = closed_workflow_summary(close_time);
+
+        let at_boundary = ListWorkflowsFilter {
+            closed_after: Some(close_time),
+            ..ListWorkflowsFilter::default()
+        };
+        let after_close = ListWorkflowsFilter {
+            closed_after: Some(close_time + chrono::Duration::seconds(1)),
+            ..ListWorkflowsFilter::default()
+        };
+
+        assert!(at_boundary.matches(&summary));
+        assert!(!after_close.matches(&summary));
+    }
+
+    #[test]
+    fn closed_before_filter_does_not_match_running_workflows() {
+        let summary = workflow_summary();
+
+        let filter = ListWorkflowsFilter {
+            closed_before: Some(DateTime::<Utc>::default() + chrono::Duration::hours(24)),
+            ..ListWorkflowsFilter::default()
+        };
+        assert!(!filter.matches(&summary));
+    }
+
+    #[test]
+    fn closed_before_filter_matches_closed_workflow_at_boundary() {
+        let close_time = DateTime::<Utc>::default() + chrono::Duration::hours(1);
+        let summary = closed_workflow_summary(close_time);
+
+        let at_boundary = ListWorkflowsFilter {
+            closed_before: Some(close_time),
+            ..ListWorkflowsFilter::default()
+        };
+        let before_close = ListWorkflowsFilter {
+            closed_before: Some(close_time - chrono::Duration::seconds(1)),
+            ..ListWorkflowsFilter::default()
+        };
+
+        assert!(at_boundary.matches(&summary));
+        assert!(!before_close.matches(&summary));
+    }
+
+    #[test]
+    fn combined_filters_require_all_predicates_to_match() {
+        let close_time = DateTime::<Utc>::default() + chrono::Duration::hours(1);
+        let summary = closed_workflow_summary(close_time);
+
+        let all_match = ListWorkflowsFilter {
+            workflow_type: Some(String::from("example")),
+            status: Some(WorkflowStatus::Completed),
+            started_before: Some(summary.start_time + chrono::Duration::seconds(1)),
+            closed_after: Some(close_time - chrono::Duration::seconds(1)),
+            ..ListWorkflowsFilter::default()
+        };
+        assert!(all_match.matches(&summary));
+
+        let one_mismatches = ListWorkflowsFilter {
+            workflow_type: Some(String::from("example")),
+            status: Some(WorkflowStatus::Failed),
+            started_before: Some(summary.start_time + chrono::Duration::seconds(1)),
+            closed_after: Some(close_time - chrono::Duration::seconds(1)),
+            ..ListWorkflowsFilter::default()
+        };
+        assert!(!one_mismatches.matches(&summary));
+    }
+
     fn workflow_summary() -> WorkflowSummary {
         let mut search_attributes = HashMap::new();
         search_attributes.insert(
@@ -376,6 +529,14 @@ mod tests {
             start_time: DateTime::<Utc>::default(),
             close_time: None,
             search_attributes,
+        }
+    }
+
+    fn closed_workflow_summary(close_time: DateTime<Utc>) -> WorkflowSummary {
+        WorkflowSummary {
+            status: WorkflowStatus::Completed,
+            close_time: Some(close_time),
+            ..workflow_summary()
         }
     }
 }
