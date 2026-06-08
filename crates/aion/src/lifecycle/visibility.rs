@@ -128,7 +128,10 @@ mod tests {
     fn envelope(workflow_id: &WorkflowId, seq: u64) -> EventEnvelope {
         EventEnvelope {
             seq,
-            recorded_at: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()
+            recorded_at: Utc
+                .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+                .single()
+                .expect("test timestamp")
                 + chrono::Duration::seconds(i64::from(seq as u32)),
             workflow_id: workflow_id.clone(),
         }
@@ -253,6 +256,31 @@ mod tests {
         let run_id = RunId::new_v4();
         let history = vec![workflow_started(&wf_id, &run_id)];
         assert_eq!(terminal_recorded_at(&history), None);
+    }
+
+    #[test]
+    fn terminal_recorded_at_finds_terminal_after_interleaved_non_terminal_events() {
+        let wf_id = WorkflowId::new_v4();
+        let run_id = RunId::new_v4();
+        let terminal_env = envelope(&wf_id, 4);
+        let expected = terminal_env.recorded_at;
+        let history = vec![
+            workflow_started(&wf_id, &run_id),
+            Event::SignalReceived {
+                envelope: envelope(&wf_id, 2),
+                name: String::from("wake"),
+                payload: payload(),
+            },
+            Event::TimerFired {
+                envelope: envelope(&wf_id, 3),
+                timer_id: aion_core::TimerId::named("t1").expect("test timer id"),
+            },
+            Event::WorkflowCompleted {
+                envelope: terminal_env,
+                result: payload(),
+            },
+        ];
+        assert_eq!(terminal_recorded_at(&history), Some(expected));
     }
 
     #[test]
