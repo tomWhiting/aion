@@ -1388,8 +1388,8 @@ mod tests {
         let second = engine.shutdown();
 
         assert!(
-            second.is_ok() || matches!(second, Err(EngineError::Runtime { .. })),
-            "double shutdown should not panic; got {second:?}"
+            second.is_ok(),
+            "double shutdown should succeed; got {second:?}"
         );
         Ok(())
     }
