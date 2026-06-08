@@ -1369,4 +1369,61 @@ mod tests {
         assert!(matches!(result, Err(EngineError::ShuttingDown)));
         Ok(())
     }
+
+    #[tokio::test]
+    async fn shutdown_is_idempotent() -> Result<(), Box<dyn std::error::Error>> {
+        let store: Arc<dyn EventStore> = Arc::new(InMemoryStore::default());
+        let engine =
+            engine_with_loaded_workflow(Arc::clone(&store), "checkout", "checkout_deployed")?;
+        let handle = engine.start_workflow("checkout", payload("input")?).await?;
+        terminate::complete(
+            termination_context(&engine),
+            handle.workflow_id(),
+            handle.run_id(),
+            payload("result")?,
+        )
+        .await?;
+
+        engine.shutdown()?;
+        let second = engine.shutdown();
+
+        assert!(
+            second.is_ok() || matches!(second, Err(EngineError::Runtime { .. })),
+            "double shutdown should not panic; got {second:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_rejects_schedule_creation() -> Result<(), Box<dyn std::error::Error>> {
+        let store: Arc<dyn EventStore> = Arc::new(InMemoryStore::default());
+        let engine =
+            engine_with_loaded_workflow(Arc::clone(&store), "checkout", "checkout_deployed")?;
+        let handle = engine.start_workflow("checkout", payload("input")?).await?;
+        terminate::complete(
+            termination_context(&engine),
+            handle.workflow_id(),
+            handle.run_id(),
+            payload("result")?,
+        )
+        .await?;
+        engine.shutdown()?;
+
+        let config = aion_core::ScheduleConfig {
+            trigger: aion_core::TriggerSpec::Interval {
+                period: std::time::Duration::from_secs(60),
+            },
+            overlap_policy: aion_core::OverlapPolicy::Skip,
+            catch_up_policy: aion_core::CatchUpPolicy::Skip,
+            workflow_type: String::from("checkout"),
+            input: payload("scheduled")?,
+        };
+        let result = engine.create_schedule(config).await;
+
+        assert!(
+            matches!(result, Err(EngineError::ShuttingDown)),
+            "create_schedule after shutdown should return ShuttingDown; got {result:?}"
+        );
+        Ok(())
+    }
 }

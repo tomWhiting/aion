@@ -222,6 +222,21 @@ async fn read_run_chain_returns_parent_links_in_chronological_order()
     Ok(())
 }
 
+#[tokio::test]
+async fn read_run_chain_for_unknown_workflow_returns_empty_chain()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_engine, store) = common::engine_with_fixture("wait").await?;
+    let unknown_id = WorkflowId::new_v4();
+
+    let chain = store.read_run_chain(&unknown_id).await?;
+
+    assert!(
+        chain.is_empty(),
+        "run chain for unknown workflow should be empty, got {chain:?}"
+    );
+    Ok(())
+}
+
 fn carried_payload(label: &str) -> Result<Payload, aion_core::PayloadError> {
     payload(&json!({ "carried": label }))
 }
