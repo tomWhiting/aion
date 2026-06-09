@@ -5,7 +5,7 @@ use std::sync::Arc;
 use aion_core::{Event, Payload};
 use aion_package::ContentHash;
 use aion_store::visibility::VisibilityStore;
-use aion_store::{EventStore, InMemoryStore};
+use aion_store::{EventStore, InMemoryStore, ReadableEventStore};
 use serde_json::json;
 
 use super::{

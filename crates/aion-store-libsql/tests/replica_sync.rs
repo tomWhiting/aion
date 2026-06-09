@@ -4,7 +4,10 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aion_store::{Event, EventEnvelope, EventStore, Payload, StoreError, WorkflowId, WriteToken};
+use aion_store::{
+    Event, EventEnvelope, Payload, ReadableEventStore, StoreError, WorkflowId, WritableEventStore,
+    WriteToken,
+};
 use aion_store_libsql::{LibSqlConfig, LibSqlMode, LibSqlStore};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;

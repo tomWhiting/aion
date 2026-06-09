@@ -236,7 +236,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use aion_store::{Event, EventStore, StoreError, WorkflowId, WriteToken};
+    use aion_store::{Event, StoreError, WorkflowId, WritableEventStore, WriteToken};
     use chrono::{DateTime, Utc};
     use libsql::params;
     use serde_json::{Value, json};

@@ -138,7 +138,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use aion_store::{EventStore, ReadableEventStore, StoreError};
+    use aion_store::{EventStore, StoreError};
 
     use super::LibSqlStore;
 

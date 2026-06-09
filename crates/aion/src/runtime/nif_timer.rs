@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use aion_core::{Event, TimerId, WorkflowId};
-use aion_store::EventStore;
+use aion_store::{EventStore, ReadableEventStore};
 use beamr::native::ProcessContext;
 use beamr::term::Term;
 use chrono::{DateTime, Utc};
@@ -31,7 +31,9 @@ struct TimerNifBridge {
 impl TimerNifBridge {
     fn service(self: &Arc<Self>) -> TimerService {
         let engine: Arc<dyn EngineHandle> = self.clone();
-        TimerService::with_recorded_at(engine, Arc::clone(&self.store), deterministic_epoch)
+        let store: Arc<dyn ReadableEventStore> =
+            Arc::clone(&self.store) as Arc<dyn ReadableEventStore>;
+        TimerService::with_recorded_at(engine, store, deterministic_epoch)
     }
 }
 

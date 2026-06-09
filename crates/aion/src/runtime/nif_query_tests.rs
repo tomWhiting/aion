@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use aion_core::{Event, WorkflowId, WorkflowStatus};
 use aion_package::ContentHash;
-use aion_store::{EventStore as _, InMemoryStore};
+use aion_store::{InMemoryStore, ReadableEventStore};
 use beamr::term::Term;
 
 use super::*;

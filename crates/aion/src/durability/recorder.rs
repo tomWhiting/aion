@@ -724,7 +724,9 @@ mod tests {
         SearchAttributeValue, TimerId,
     };
     use aion_store::visibility::{ListWorkflowsFilter, VisibilityStore};
-    use aion_store::{EventStore, InMemoryStore, StoreError, WriteToken};
+    use aion_store::{
+        InMemoryStore, ReadableEventStore, StoreError, WritableEventStore, WriteToken,
+    };
     use chrono::{DateTime, Utc};
     use serde_json::json;
 

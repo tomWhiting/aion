@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aion_store::{
-    Event, EventEnvelope, EventStore, Payload, StoreError, TimerEntry, TimerId, WorkflowId,
-    WriteToken,
+    Event, EventEnvelope, Payload, ReadableEventStore, StoreError, TimerEntry, TimerId, WorkflowId,
+    WritableEventStore, WriteToken,
 };
 use aion_store_libsql::LibSqlStore;
 use chrono::{DateTime, Utc};

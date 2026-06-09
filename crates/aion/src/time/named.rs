@@ -106,7 +106,7 @@ mod tests {
     use std::time::Duration;
 
     use aion_core::{Event, IdError, TimerId, WorkflowId};
-    use aion_store::{EventStore, InMemoryStore, StoreError};
+    use aion_store::{EventStore, InMemoryStore, ReadableEventStore, StoreError};
     use chrono::{DateTime, Utc};
 
     use super::{SleepTimerError, cancel_timer, sleep, start_timer};

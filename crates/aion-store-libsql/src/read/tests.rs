@@ -2,7 +2,8 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aion_store::{
-    Event, EventStore, StoreError, WorkflowFilter, WorkflowId, WorkflowStatus, WriteToken,
+    Event, ReadableEventStore, StoreError, WorkflowFilter, WorkflowId, WorkflowStatus,
+    WritableEventStore, WriteToken,
 };
 use chrono::{DateTime, Utc};
 use serde_json::json;

@@ -125,7 +125,7 @@ mod tests {
     use std::time::Duration;
 
     use aion_core::{ContentType, Event, Payload, TimerId, WorkflowId};
-    use aion_store::{EventStore as _, InMemoryStore};
+    use aion_store::{InMemoryStore, ReadableEventStore};
 
     use super::{QueryError, QueryService};
     use crate::Pid;

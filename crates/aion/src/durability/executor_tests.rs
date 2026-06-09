@@ -7,7 +7,7 @@ use aion_core::{
     ActivityError, ActivityErrorKind, ActivityId, Event, EventEnvelope, Payload, TimerId,
     WorkflowId,
 };
-use aion_store::{EventStore, InMemoryStore};
+use aion_store::{EventStore, InMemoryStore, ReadableEventStore};
 use chrono::{DateTime, TimeZone, Utc};
 use serde_json::json;
 use uuid::Uuid;
