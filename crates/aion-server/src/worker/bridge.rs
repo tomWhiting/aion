@@ -46,117 +46,19 @@
 //! `timeout_seconds` and by worker liveness — never by an engine constant.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aion::{ActivityDispatch, ActivityDispatcher};
-use aion_core::{ActivityId, ContentType, Payload, WorkflowId};
+use aion_core::{ActivityId, WorkflowId};
 use aion_proto::{ProtoActivityId, ProtoActivityTask, ProtoPayload, ProtoWorkflowId};
-use dashmap::DashMap;
 
-use super::dispatch::{ActivityCompletion, ActivityCompletionOutcome, ActivityCompletionSink};
 use super::heartbeat::{HeartbeatTracker, InFlightActivity};
+use super::pending::{
+    ActivityDispatchContext, PendingActivities, SyncReceiver, log_activity_completion,
+};
 use super::registry::{ConnectedWorkerRegistry, WorkerHandle, WorkerId, WorkerMessage};
-use crate::error::ServerError;
 use crate::shutdown::DrainState;
 use tracing::info_span;
-
-type SyncSender = std::sync::mpsc::SyncSender<Result<String, String>>;
-type SyncReceiver = std::sync::mpsc::Receiver<Result<String, String>>;
-
-/// Execution-scoped key for an in-flight activity dispatch.
-///
-/// The engine seam ([`ActivityDispatch`]) carries the *real* workflow id and
-/// the *real* per-workflow activity ordinal recorded in history, so this pair
-/// uniquely and stably identifies one execution. Keying by bare [`ActivityId`]
-/// would be unsafe across server restarts — a stale result re-reported from a
-/// worker's previous session could complete a *different* post-restart
-/// dispatch reusing the same ordinal — but pairing it with the real workflow
-/// id closes that race: two different workflow executions never share a
-/// workflow id, so a stale `(workflow_id, activity_id)` from a previous server
-/// life can only ever match the exact execution it belongs to.
-///
-/// The wire (`ActivityResult`) carries both ids, plus an attempt discriminator
-/// (`ActivityTask.attempt`). The pending key stays attempt-free for now: a
-/// retry re-dispatches under the same `(workflow_id, activity_id)` and the
-/// outstanding entry is the one awaiting completion. Redelivery bookkeeping
-/// can widen this key with the wire attempt later — no protocol change needed.
-type PendingActivityKey = (WorkflowId, ActivityId);
-
-/// Tracks in-flight activity dispatches waiting for worker results.
-///
-/// When the server's worker stream handler receives an `ActivityResult`, it
-/// calls [`complete_activity`](ActivityCompletionSink::complete_activity) to
-/// deliver the result to the blocked NIF thread. Entries are keyed by
-/// [`PendingActivityKey`] so a stale result from a previous server life can
-/// never be matched to a different execution (#59).
-#[derive(Clone, Debug, Default)]
-pub struct PendingActivities {
-    pending: Arc<DashMap<PendingActivityKey, SyncSender>>,
-}
-
-impl PendingActivities {
-    fn insert(&self, workflow_id: WorkflowId, activity_id: ActivityId) -> SyncReceiver {
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        self.pending.insert((workflow_id, activity_id), tx);
-        rx
-    }
-
-    fn complete(&self, key: &PendingActivityKey, result: Result<String, String>) -> bool {
-        if let Some((_, sender)) = self.pending.remove(key) {
-            sender.send(result).is_ok()
-        } else {
-            false
-        }
-    }
-}
-
-impl ActivityCompletionSink for PendingActivities {
-    fn complete_activity(&self, completion: ActivityCompletion) -> Result<(), ServerError> {
-        let result = match completion.outcome {
-            ActivityCompletionOutcome::Succeeded(payload) => {
-                payload_to_string(&payload).map_err(|reason| {
-                    tracing::error!(
-                        operation = "activity_complete",
-                        workflow_id = %completion.workflow_id,
-                        activity_id = %completion.activity_id,
-                        error_type = "ActivityResultDecode",
-                        %reason,
-                        "activity completion failed"
-                    );
-                    ServerError::worker_dispatch("", "", format!("payload decode: {reason}"))
-                })?
-            }
-            ActivityCompletionOutcome::Failed(error) => {
-                let prefix = if error.is_retryable() {
-                    "retryable"
-                } else {
-                    "terminal"
-                };
-                tracing::error!(
-                    operation = "activity_complete",
-                    workflow_id = %completion.workflow_id,
-                    activity_id = %completion.activity_id,
-                    error_type = "ActivityFailed",
-                    error_kind = prefix,
-                    reason = %error.message,
-                    "activity completion failed"
-                );
-                Err(format!("{prefix}:{}", error.message))
-            }
-        };
-        self.complete(&(completion.workflow_id, completion.activity_id), result);
-        Ok(())
-    }
-}
-
-fn payload_to_string(payload: &Payload) -> Result<Result<String, String>, String> {
-    match payload.content_type() {
-        ContentType::Json => String::from_utf8(payload.bytes().to_vec())
-            .map(Ok)
-            .map_err(|_| "activity result payload is not valid UTF-8".to_owned()),
-    }
-}
 
 /// Dispatcher that routes `run_activity` NIF calls to connected workers.
 ///
@@ -254,20 +156,24 @@ impl WorkerActivityDispatcher {
             })
     }
 
-    /// Select a worker for the namespace and activity type, waiting if none is
-    /// currently available. Blocks until a matching worker registers or the
-    /// server begins draining.
-    fn select_worker_or_wait(
+    /// Obtain the rotation-ordered candidate workers for the namespace and
+    /// activity type, waiting if none is currently registered. Blocks until at
+    /// least one matching worker registers or the server begins draining.
+    ///
+    /// The returned list is never empty; ordering is the registry's
+    /// per-`(namespace, activity_type)` round-robin so successive dispatches
+    /// start at different workers.
+    fn candidates_or_wait(
         &self,
         namespace: &str,
         activity_type: &str,
         workflow_id: &WorkflowId,
         activity_id: &ActivityId,
-    ) -> Result<WorkerHandle, String> {
+    ) -> Result<Vec<WorkerHandle>, String> {
         loop {
-            match self.registry.select_worker(namespace, activity_type) {
-                Ok(Some(worker)) => return Ok(worker),
-                Ok(None) => {
+            match self.registry.workers_for(namespace, activity_type) {
+                Ok(workers) if !workers.is_empty() => return Ok(workers),
+                Ok(_) => {
                     self.ensure_accepting(
                         namespace,
                         activity_type,
@@ -282,19 +188,7 @@ impl WorkerActivityDispatcher {
                         activity_id = %activity_id,
                         "no connected worker; waiting for a matching worker to register"
                     );
-                    match &self.tokio_handle {
-                        Some(handle) => {
-                            handle.block_on(self.registry.wait_for_worker());
-                        }
-                        None => match tokio::runtime::Handle::try_current() {
-                            Ok(handle) => {
-                                handle.block_on(self.registry.wait_for_worker());
-                            }
-                            Err(_) => {
-                                std::thread::sleep(Duration::from_millis(500));
-                            }
-                        },
-                    }
+                    self.wait_for_worker();
                 }
                 Err(error) => {
                     let reason = format!("registry error: {error}");
@@ -310,6 +204,20 @@ impl WorkerActivityDispatcher {
                     return Err(reason);
                 }
             }
+        }
+    }
+
+    /// Block the calling thread until a new worker registers, using whichever
+    /// runtime handle is available. Mirrors the dispatch blocking contract: on
+    /// a beamr/plain thread with no runtime it falls back to a short sleep so
+    /// the caller re-polls the registry.
+    fn wait_for_worker(&self) {
+        match &self.tokio_handle {
+            Some(handle) => handle.block_on(self.registry.wait_for_worker()),
+            None => match tokio::runtime::Handle::try_current() {
+                Ok(handle) => handle.block_on(self.registry.wait_for_worker()),
+                Err(_) => std::thread::sleep(Duration::from_millis(500)),
+            },
         }
     }
 
@@ -350,41 +258,178 @@ impl WorkerActivityDispatcher {
         workflow_id: &WorkflowId,
         activity_id: &ActivityId,
     ) {
-        self.pending
-            .pending
-            .remove(&(workflow_id.clone(), activity_id.clone()));
+        self.pending.remove(workflow_id, activity_id);
         let _ = self
             .heartbeat_tracker
             .complete_task(worker_id, workflow_id, activity_id);
         self.drain_state.notify_activity_drained();
     }
 
-    fn send_activity_task(
+    /// Place the activity with a connected worker, round-robining across the
+    /// rotation-ordered candidates and falling back past any whose channel is
+    /// full or closed. Returns the worker that accepted the task.
+    ///
+    /// The pending completion entry is registered by the caller before this
+    /// runs and is shared across attempts — it is keyed by the execution
+    /// `(workflow_id, activity_id)`, not by worker — so a failed attempt rolls
+    /// back only that worker's heartbeat tracking and the shared entry survives
+    /// for the next candidate. The drain gate is re-checked before every
+    /// attempt. On any failure to place the task — no candidate accepted it, the
+    /// drain gate closed (including while waiting for a worker), or a registry
+    /// or tracker error — the shared pending entry is abandoned exactly once so
+    /// it can never outlive a dispatch that never reached a worker.
+    fn place_activity(
         &self,
-        worker: &WorkerHandle,
-        task: ProtoActivityTask,
+        namespace: &str,
+        activity_type: &str,
+        task: &ProtoActivityTask,
+        workflow_id: &WorkflowId,
+        activity_id: &ActivityId,
+    ) -> Result<WorkerId, String> {
+        self.place_on_candidate(namespace, activity_type, task, workflow_id, activity_id)
+            .inspect_err(|_| self.abandon_pending(workflow_id, activity_id))
+    }
+
+    /// Inner placement: obtain the candidate list (waiting if needed) and try
+    /// each until one accepts. Every error path returns through here so the
+    /// single `abandon_pending` in [`place_activity`] cleans up the shared
+    /// pending entry — including the `candidates_or_wait` drain/registry errors
+    /// that the pending entry is already live for.
+    fn place_on_candidate(
+        &self,
+        namespace: &str,
+        activity_type: &str,
+        task: &ProtoActivityTask,
+        workflow_id: &WorkflowId,
+        activity_id: &ActivityId,
+    ) -> Result<WorkerId, String> {
+        let candidates =
+            self.candidates_or_wait(namespace, activity_type, workflow_id, activity_id)?;
+        match self.try_candidates(&candidates, activity_type, task, workflow_id, activity_id)? {
+            Some(worker_id) => Ok(worker_id),
+            None => Err(self.all_workers_closed(activity_type, workflow_id, activity_id)),
+        }
+    }
+
+    /// Try each rotation-ordered candidate until one accepts the task.
+    ///
+    /// Returns `Ok(Some(worker_id))` for the worker that accepted, `Ok(None)`
+    /// when every candidate's channel was closed, or `Err` if the drain gate
+    /// closed or heartbeat tracking failed mid-iteration. A candidate is
+    /// tracked immediately before its send so the heartbeat tracker reflects
+    /// only the in-flight attempt; a closed channel rolls that tracking back
+    /// and deregisters the worker before advancing.
+    fn try_candidates(
+        &self,
+        candidates: &[WorkerHandle],
+        activity_type: &str,
+        task: &ProtoActivityTask,
+        workflow_id: &WorkflowId,
+        activity_id: &ActivityId,
+    ) -> Result<Option<WorkerId>, String> {
+        for worker in candidates {
+            let worker_id = worker.id();
+            self.ensure_accepting(
+                &self.namespace,
+                activity_type,
+                workflow_id,
+                activity_id,
+                Some(worker_id),
+            )?;
+            self.track_worker_task(worker_id, activity_type, workflow_id, activity_id)?;
+            match worker
+                .sender()
+                .try_send(WorkerMessage::ActivityTask(task.clone()))
+            {
+                Ok(()) => return Ok(Some(worker_id)),
+                Err(error) => {
+                    let reason = format!("worker task channel full or closed: {error}");
+                    self.fallback_past_closed_worker(
+                        worker_id,
+                        activity_type,
+                        workflow_id,
+                        activity_id,
+                        &reason,
+                    );
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Roll back a failed delivery attempt: untrack this worker's heartbeat
+    /// entry (waking any drain waiter, since in-flight accounting may now be
+    /// zero) and deregister the worker whose channel is gone so the rotation
+    /// never offers it again. The shared pending entry is deliberately left in
+    /// place for the next candidate.
+    fn fallback_past_closed_worker(
+        &self,
+        worker_id: WorkerId,
         activity_type: &str,
         workflow_id: &WorkflowId,
         activity_id: &ActivityId,
-    ) -> Result<(), String> {
-        match worker.sender().try_send(WorkerMessage::ActivityTask(task)) {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                let worker_id = worker.id();
-                let reason = format!("worker task channel full or closed: {error}");
-                self.cleanup_activity(worker_id, workflow_id, activity_id);
-                log_worker_error(
-                    "WorkerChannelClosed",
-                    &self.namespace,
-                    activity_type,
-                    workflow_id,
-                    activity_id,
-                    Some(worker_id),
-                    &reason,
-                );
-                Err(reason)
-            }
+        reason: &str,
+    ) {
+        let _ = self
+            .heartbeat_tracker
+            .complete_task(worker_id, workflow_id, activity_id);
+        self.drain_state.notify_activity_drained();
+        log_worker_error(
+            "WorkerChannelClosed",
+            &self.namespace,
+            activity_type,
+            workflow_id,
+            activity_id,
+            Some(worker_id),
+            reason,
+        );
+        if let Err(error) = self.registry.deregister(worker_id) {
+            log_worker_error(
+                "WorkerRegistry",
+                &self.namespace,
+                activity_type,
+                workflow_id,
+                activity_id,
+                Some(worker_id),
+                &format!("deregister after closed channel failed: {error}"),
+            );
         }
+    }
+
+    /// Drop the shared pending completion entry for an execution that never
+    /// reached a worker and wake any drain waiter. Used when placement gives up
+    /// (drain closed, every candidate closed, or a registry/tracker error).
+    fn abandon_pending(&self, workflow_id: &WorkflowId, activity_id: &ActivityId) {
+        self.pending.remove(workflow_id, activity_id);
+        self.drain_state.notify_activity_drained();
+    }
+
+    /// Build and log the error returned when every rotation candidate's channel
+    /// was closed before the task could be delivered.
+    ///
+    /// Deliberately unprefixed: this is an engine-level "could not place the
+    /// work anywhere" failure, which the SDK maps to an activity engine
+    /// failure — the same classification the single-worker closed-channel path
+    /// produced before this became a fallback loop. Reclassifying worker
+    /// exhaustion as retryable is the workflow-resilience work's call, not this
+    /// brief's.
+    fn all_workers_closed(
+        &self,
+        activity_type: &str,
+        workflow_id: &WorkflowId,
+        activity_id: &ActivityId,
+    ) -> String {
+        let reason = "all matching worker streams closed before task could be delivered".to_owned();
+        log_worker_error(
+            "WorkerChannelClosed",
+            &self.namespace,
+            activity_type,
+            workflow_id,
+            activity_id,
+            None,
+            &reason,
+        );
+        reason
     }
 
     /// Block until the dispatch terminates (see the module docs for the
@@ -467,8 +512,7 @@ impl WorkerActivityDispatcher {
         result: Result<String, String>,
     ) -> Result<String, String> {
         self.pending
-            .pending
-            .remove(&(context.workflow_id.clone(), context.activity_id.clone()));
+            .remove(context.workflow_id, context.activity_id);
         log_activity_completion(context, result.is_ok());
         result.inspect_err(|reason| {
             log_worker_error(
@@ -542,8 +586,19 @@ impl WorkerActivityDispatcher {
         } = request;
         let started_at = Instant::now();
         self.ensure_accepting(&namespace, &name, &workflow_id, &activity_id, None)?;
-        let worker = self.select_worker_or_wait(&namespace, &name, &workflow_id, &activity_id)?;
-        let worker_id = worker.id();
+
+        // Register the shared completion entry before placement so a fast
+        // worker result can never arrive before the receiver exists. Placement
+        // round-robins across the rotation-ordered candidates and falls back
+        // past closed channels; on success the chosen worker is tracked in the
+        // heartbeat tracker, on exhaustion this entry is abandoned for us.
+        let task = activity_task(&name, &input, &workflow_id, &activity_id, attempt, labels);
+        let rx = self
+            .pending
+            .insert(workflow_id.clone(), activity_id.clone());
+        let worker_id =
+            self.place_activity(&namespace, &name, &task, &workflow_id, &activity_id)?;
+
         let span = info_span!(
             "activity_dispatch",
             operation = "activity_dispatch",
@@ -554,20 +609,6 @@ impl WorkerActivityDispatcher {
             worker_id = ?worker_id,
         );
         let _span_guard = span.enter();
-        self.ensure_accepting(
-            &namespace,
-            &name,
-            &workflow_id,
-            &activity_id,
-            Some(worker_id),
-        )?;
-
-        let task = activity_task(&name, &input, &workflow_id, &activity_id, attempt, labels);
-        let rx = self
-            .pending
-            .insert(workflow_id.clone(), activity_id.clone());
-        self.track_worker_task(worker_id, &name, &workflow_id, &activity_id)?;
-        self.send_activity_task(&worker, task, &name, &workflow_id, &activity_id)?;
         let context = ActivityDispatchContext {
             namespace: &namespace,
             activity_type: &name,
@@ -578,15 +619,6 @@ impl WorkerActivityDispatcher {
         };
         self.await_activity_result(&context, &rx)
     }
-}
-
-struct ActivityDispatchContext<'a> {
-    namespace: &'a str,
-    activity_type: &'a str,
-    worker_id: WorkerId,
-    workflow_id: &'a WorkflowId,
-    activity_id: &'a ActivityId,
-    started_at: Instant,
 }
 
 fn activity_task(
@@ -608,25 +640,6 @@ fn activity_task(
         attempt,
         labels: labels.into_iter().collect(),
     }
-}
-
-fn log_activity_completion(context: &ActivityDispatchContext<'_>, succeeded: bool) {
-    let duration_ms = duration_ms(context.started_at.elapsed());
-    tracing::info!(
-        operation = "activity_complete",
-        namespace = context.namespace,
-        workflow_id = %context.workflow_id,
-        activity_id = %context.activity_id,
-        activity_type = context.activity_type,
-        worker_id = ?context.worker_id,
-        duration_ms,
-        outcome = if succeeded { "succeeded" } else { "failed" },
-        "activity completed"
-    );
-}
-
-fn duration_ms(duration: Duration) -> u64 {
-    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn log_worker_error(
@@ -653,129 +666,17 @@ fn log_worker_error(
 
 #[cfg(test)]
 mod tests {
-    use aion_core::{ActivityError, ActivityErrorKind, ContentType, Payload};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use aion_core::{ContentType, Payload};
+
+    use super::super::dispatch::{
+        ActivityCompletion, ActivityCompletionOutcome, ActivityCompletionSink,
+    };
+    use super::super::registry::WorkerRegistration;
     use super::*;
-
-    fn activity_id(pos: u64) -> ActivityId {
-        ActivityId::from_sequence_position(pos)
-    }
-
-    #[test]
-    fn pending_insert_and_complete_delivers_result() {
-        let pending = PendingActivities::default();
-        let workflow_id = WorkflowId::new_v4();
-        let id = activity_id(1);
-        let rx = pending.insert(workflow_id.clone(), id.clone());
-
-        assert!(pending.complete(&(workflow_id, id), Ok("done".to_owned())));
-        assert_eq!(
-            rx.recv_timeout(Duration::from_millis(50)),
-            Ok(Ok("done".to_owned()))
-        );
-    }
-
-    #[test]
-    fn pending_complete_unknown_returns_false() {
-        let pending = PendingActivities::default();
-        assert!(!pending.complete(
-            &(WorkflowId::new_v4(), activity_id(99)),
-            Ok("orphan".to_owned())
-        ));
-    }
-
-    #[test]
-    fn completion_sink_routes_success() -> Result<(), ServerError> {
-        let pending = PendingActivities::default();
-        let workflow_id = WorkflowId::new_v4();
-        let id = activity_id(2);
-        let rx = pending.insert(workflow_id.clone(), id.clone());
-        let payload = Payload::new(ContentType::Json, br#"{"greeting":"hi"}"#.to_vec());
-
-        pending.complete_activity(ActivityCompletion {
-            workflow_id,
-            activity_id: id,
-            outcome: ActivityCompletionOutcome::Succeeded(payload),
-        })?;
-
-        let result = rx
-            .recv_timeout(Duration::from_millis(50))
-            .map_err(|e| ServerError::worker_dispatch("", "", format!("channel: {e}")))?;
-        assert_eq!(result, Ok(r#"{"greeting":"hi"}"#.to_owned()));
-        Ok(())
-    }
-
-    #[test]
-    fn completion_sink_routes_retryable_error() -> Result<(), ServerError> {
-        let pending = PendingActivities::default();
-        let workflow_id = WorkflowId::new_v4();
-        let id = activity_id(3);
-        let rx = pending.insert(workflow_id.clone(), id.clone());
-
-        pending.complete_activity(ActivityCompletion {
-            workflow_id,
-            activity_id: id,
-            outcome: ActivityCompletionOutcome::Failed(ActivityError {
-                kind: ActivityErrorKind::Retryable,
-                message: "temporary".to_owned(),
-                details: None,
-            }),
-        })?;
-
-        let result = rx
-            .recv_timeout(Duration::from_millis(50))
-            .map_err(|e| ServerError::worker_dispatch("", "", format!("channel: {e}")))?;
-        assert_eq!(result, Err("retryable:temporary".to_owned()));
-        Ok(())
-    }
-
-    /// Regression test (#59, brief D12): pending tracking must be keyed by
-    /// the full `(WorkflowId, ActivityId)` pair. The dispatcher fabricates
-    /// activity ids from a process-local counter that resets on server
-    /// restart, so a stale result re-reported from a worker's previous
-    /// session carries the same bare `ActivityId` as a fresh post-restart
-    /// dispatch. Under bare-`ActivityId` keying the stale result completed
-    /// the wrong execution; with pair keying it is dropped and the genuine
-    /// result still completes.
-    #[test]
-    fn stale_result_for_other_workflow_does_not_complete_pending_dispatch()
-    -> Result<(), ServerError> {
-        let pending = PendingActivities::default();
-        let post_restart_workflow = WorkflowId::new_v4();
-        let pre_restart_workflow = WorkflowId::new_v4();
-        // Counter resets to the same sequence position after restart.
-        let id = activity_id(1);
-        let rx = pending.insert(post_restart_workflow.clone(), id.clone());
-
-        // Stale pre-restart result: same activity id, different workflow.
-        pending.complete_activity(ActivityCompletion {
-            workflow_id: pre_restart_workflow,
-            activity_id: id.clone(),
-            outcome: ActivityCompletionOutcome::Succeeded(Payload::new(
-                ContentType::Json,
-                br#""stale""#.to_vec(),
-            )),
-        })?;
-        assert!(
-            rx.try_recv().is_err(),
-            "stale result for a different workflow must not complete this dispatch"
-        );
-
-        // The genuine result for the pending execution still completes.
-        pending.complete_activity(ActivityCompletion {
-            workflow_id: post_restart_workflow,
-            activity_id: id,
-            outcome: ActivityCompletionOutcome::Succeeded(Payload::new(
-                ContentType::Json,
-                br#""fresh""#.to_vec(),
-            )),
-        })?;
-        let result = rx
-            .recv_timeout(Duration::from_millis(50))
-            .map_err(|e| ServerError::worker_dispatch("", "", format!("channel: {e}")))?;
-        assert_eq!(result, Ok(r#""fresh""#.to_owned()));
-        Ok(())
-    }
+    use crate::error::ServerError;
 
     /// Liveness tracker for dispatcher unit tests; the window only matters
     /// to expiry checks, which nothing in these tests drives.
@@ -915,6 +816,317 @@ mod tests {
             "fail-fast path took {elapsed:?}"
         );
         registration.deregister()?;
+        Ok(())
+    }
+
+    /// Register a live `greet` worker whose stream echoes every task back as a
+    /// success through the shared completion sink, and count the tasks it
+    /// receives. The returned registration keeps the worker connected until the
+    /// caller drops or deregisters it (which closes the stream and ends the
+    /// echo task).
+    fn spawn_echo_worker(
+        registry: &ConnectedWorkerRegistry,
+        pending: &PendingActivities,
+    ) -> Result<
+        (
+            Arc<AtomicUsize>,
+            WorkerRegistration,
+            tokio::task::JoinHandle<()>,
+        ),
+        ServerError,
+    > {
+        let (worker_tx, mut worker_rx) = tokio::sync::mpsc::channel(8);
+        let activity_types = [String::from("greet")];
+        let registration = registry.register("default", activity_types.iter(), worker_tx)?;
+        let counter = Arc::new(AtomicUsize::new(0));
+        let task_counter = Arc::clone(&counter);
+        let sink = pending.clone();
+        let echo = tokio::spawn(async move {
+            while let Some(WorkerMessage::ActivityTask(task)) = worker_rx.recv().await {
+                task_counter.fetch_add(1, Ordering::SeqCst);
+                let workflow_id = task
+                    .workflow_id
+                    .and_then(|id| WorkflowId::try_from(id).ok());
+                let activity_id = task.activity_id.map(ActivityId::from);
+                if let (Some(workflow_id), Some(activity_id)) = (workflow_id, activity_id) {
+                    let _ = sink.complete_activity(ActivityCompletion {
+                        workflow_id,
+                        activity_id,
+                        outcome: ActivityCompletionOutcome::Succeeded(Payload::new(
+                            ContentType::Json,
+                            b"{}".to_vec(),
+                        )),
+                    });
+                }
+            }
+        });
+        Ok((counter, registration, echo))
+    }
+
+    /// Round-robin reaches the live dispatch path: three connected workers and
+    /// three same-type dispatches put exactly one task on each worker, because
+    /// the registry advances its rotation on every placement. This is the
+    /// production seam (`WorkerActivityDispatcher`), not the registry helper in
+    /// isolation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn live_dispatch_round_robins_one_task_per_worker()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let registry = ConnectedWorkerRegistry::default();
+        let pending = PendingActivities::default();
+        let mut counters = Vec::new();
+        let mut registrations = Vec::new();
+        let mut echoes = Vec::new();
+        for _ in 0..3 {
+            let (counter, registration, echo) = spawn_echo_worker(&registry, &pending)?;
+            counters.push(counter);
+            registrations.push(registration);
+            echoes.push(echo);
+        }
+
+        let dispatcher = Arc::new(
+            WorkerActivityDispatcher::new(registry, "default", test_tracker())
+                .with_pending(pending),
+        );
+        for _ in 0..3 {
+            let dispatcher = Arc::clone(&dispatcher);
+            let result = tokio::spawn(futures::future::lazy(move |_| {
+                dispatcher.dispatch(greet_request())
+            }))
+            .await?;
+            assert!(result.is_ok(), "dispatch failed: {result:?}");
+        }
+
+        for (index, counter) in counters.iter().enumerate() {
+            assert_eq!(
+                counter.load(Ordering::SeqCst),
+                1,
+                "worker {index} should have received exactly one task"
+            );
+        }
+        for registration in registrations {
+            registration.deregister()?;
+        }
+        for echo in echoes {
+            echo.await?;
+        }
+        Ok(())
+    }
+
+    /// Even distribution across the live path: six dispatches over three workers
+    /// land two on each.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn live_dispatch_distributes_evenly() -> Result<(), Box<dyn std::error::Error>> {
+        let registry = ConnectedWorkerRegistry::default();
+        let pending = PendingActivities::default();
+        let mut counters = Vec::new();
+        let mut registrations = Vec::new();
+        let mut echoes = Vec::new();
+        for _ in 0..3 {
+            let (counter, registration, echo) = spawn_echo_worker(&registry, &pending)?;
+            counters.push(counter);
+            registrations.push(registration);
+            echoes.push(echo);
+        }
+
+        let dispatcher = Arc::new(
+            WorkerActivityDispatcher::new(registry, "default", test_tracker())
+                .with_pending(pending),
+        );
+        for _ in 0..6 {
+            let dispatcher = Arc::clone(&dispatcher);
+            let result = tokio::spawn(futures::future::lazy(move |_| {
+                dispatcher.dispatch(greet_request())
+            }))
+            .await?;
+            assert!(result.is_ok(), "dispatch failed: {result:?}");
+        }
+
+        for (index, counter) in counters.iter().enumerate() {
+            assert_eq!(
+                counter.load(Ordering::SeqCst),
+                2,
+                "worker {index} should have received exactly two tasks"
+            );
+        }
+        for registration in registrations {
+            registration.deregister()?;
+        }
+        for echo in echoes {
+            echo.await?;
+        }
+        Ok(())
+    }
+
+    /// Closed-channel fallback on the live path: the rotation starts at a worker
+    /// whose stream is closed, so the dispatcher deregisters it and delivers to
+    /// the next candidate. The closed worker registered first, so it sorts to
+    /// the rotation start of a fresh registry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn live_dispatch_falls_back_past_closed_channel() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let registry = ConnectedWorkerRegistry::default();
+        let pending = PendingActivities::default();
+
+        let (closed_tx, closed_rx) = tokio::sync::mpsc::channel(1);
+        let activity_types = [String::from("greet")];
+        let closed_registration = registry.register("default", activity_types.iter(), closed_tx)?;
+        drop(closed_rx);
+        let (live_counter, live_registration, live_echo) = spawn_echo_worker(&registry, &pending)?;
+
+        let dispatcher = Arc::new(
+            WorkerActivityDispatcher::new(registry.clone(), "default", test_tracker())
+                .with_pending(pending),
+        );
+        let dispatch = Arc::clone(&dispatcher);
+        let result = tokio::spawn(futures::future::lazy(move |_| {
+            dispatch.dispatch(greet_request())
+        }))
+        .await?;
+
+        assert!(
+            result.is_ok(),
+            "dispatch should fall back to the live worker: {result:?}"
+        );
+        assert_eq!(
+            live_counter.load(Ordering::SeqCst),
+            1,
+            "the live worker received the task"
+        );
+        assert_eq!(
+            registry.workers_for("default", "greet")?.len(),
+            1,
+            "the closed worker was deregistered"
+        );
+
+        closed_registration.deregister()?;
+        live_registration.deregister()?;
+        live_echo.await?;
+        Ok(())
+    }
+
+    /// All-candidates-closed on the live path: every matching worker's stream is
+    /// closed, so the dispatch fails with the canonical all-closed message, both
+    /// workers are deregistered, and no pending entry or heartbeat tracking is
+    /// leaked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_dispatch_fails_when_all_candidates_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let registry = ConnectedWorkerRegistry::default();
+        let pending = PendingActivities::default();
+        let tracker = test_tracker();
+        let activity_types = [String::from("greet")];
+
+        let (tx_a, rx_a) = tokio::sync::mpsc::channel(1);
+        let (tx_b, rx_b) = tokio::sync::mpsc::channel(1);
+        let registration_a = registry.register("default", activity_types.iter(), tx_a)?;
+        let registration_b = registry.register("default", activity_types.iter(), tx_b)?;
+        drop(rx_a);
+        drop(rx_b);
+
+        let dispatcher =
+            WorkerActivityDispatcher::new(registry.clone(), "default", tracker.clone())
+                .with_pending(pending.clone());
+        let result = dispatcher.dispatch(greet_request());
+
+        let err = result.err().ok_or("expected an all-closed failure")?;
+        assert!(
+            err.contains("all matching worker streams closed before task could be delivered"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            registry.workers_for("default", "greet")?.is_empty(),
+            "both closed workers were deregistered"
+        );
+        assert_eq!(
+            tracker.in_flight_count()?,
+            0,
+            "no heartbeat tracking was leaked"
+        );
+        assert_eq!(pending.len(), 0, "no pending completion was leaked");
+
+        registration_a.deregister()?;
+        registration_b.deregister()?;
+        Ok(())
+    }
+
+    /// The drain gate is re-checked before each delivery attempt: with the
+    /// server draining and a worker registered, the dispatch fails with the
+    /// drain error (not a channel error) and abandons the pending entry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_dispatch_rechecks_drain_before_each_attempt()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let registry = ConnectedWorkerRegistry::default();
+        let pending = PendingActivities::default();
+        let drain = DrainState::default();
+        let activity_types = [String::from("greet")];
+        let (worker_tx, _worker_rx) = tokio::sync::mpsc::channel(1);
+        let registration = registry.register("default", activity_types.iter(), worker_tx)?;
+
+        let _ = drain.begin();
+        let dispatcher = WorkerActivityDispatcher::new(registry, "default", test_tracker())
+            .with_pending(pending.clone())
+            .with_drain_state(drain);
+
+        let result = dispatcher.dispatch(greet_request());
+
+        let err = result.err().ok_or("expected a drain failure")?;
+        assert!(err.contains("drain"), "expected drain error, got: {err}");
+        assert_eq!(pending.len(), 0, "the pending completion was abandoned");
+        registration.deregister()?;
+        Ok(())
+    }
+
+    /// Regression: a dispatch that has already registered its pending entry and
+    /// is parked waiting for a worker must not leak that entry when the server
+    /// begins draining. The pending entry is inserted before placement (to win
+    /// the fast-worker race), so the drain error raised while waiting has to
+    /// abandon it. Drains with no matching worker, then wakes the waiter via an
+    /// unrelated registration so it re-checks the gate with an empty candidate
+    /// list — the `candidates_or_wait` drain-error path, distinct from the
+    /// per-attempt check above.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn live_dispatch_parked_for_worker_abandons_pending_on_drain()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let registry = ConnectedWorkerRegistry::default();
+        let pending = PendingActivities::default();
+        let drain = DrainState::default();
+
+        let dispatcher = Arc::new(
+            WorkerActivityDispatcher::new(registry.clone(), "default", test_tracker())
+                .with_pending(pending.clone())
+                .with_drain_state(drain.clone()),
+        );
+        let dispatch = Arc::clone(&dispatcher);
+        let handle = tokio::spawn(futures::future::lazy(move |_| {
+            dispatch.dispatch(greet_request())
+        }));
+
+        // Let the dispatch reach the wait-for-worker park with its pending entry
+        // registered but no greet worker to place on.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !handle.is_finished(),
+            "dispatch should be waiting for a worker"
+        );
+        assert_eq!(pending.len(), 1, "pending entry registered while waiting");
+
+        // Begin draining, then wake the parked waiter with an unrelated
+        // registration so it re-evaluates the gate with greet still empty.
+        let _ = drain.begin();
+        let other_types = [String::from("other")];
+        let (other_tx, _other_rx) = tokio::sync::mpsc::channel(1);
+        let other = registry.register("default", other_types.iter(), other_tx)?;
+
+        let result = handle.await?;
+        let err = result.err().ok_or("expected a drain failure")?;
+        assert!(err.contains("drain"), "expected drain error, got: {err}");
+        assert_eq!(
+            pending.len(),
+            0,
+            "the pending entry must be abandoned, not leaked, on the drain-while-waiting path"
+        );
+
+        other.deregister()?;
         Ok(())
     }
 }

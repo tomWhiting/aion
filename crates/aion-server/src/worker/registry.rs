@@ -272,24 +272,6 @@ impl ConnectedWorkerRegistry {
         Ok(delivered)
     }
 
-    /// Select one worker for the namespace and activity type.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ServerError::LockPoisoned`] if the registry lock is poisoned.
-    pub fn select_worker(
-        &self,
-        namespace: &str,
-        activity_type: &str,
-    ) -> Result<Option<WorkerHandle>, ServerError> {
-        let state = self.state()?;
-        let key = (namespace.to_owned(), activity_type.to_owned());
-        Ok(state
-            .by_activity
-            .get(&key)
-            .and_then(|workers| workers.values().min_by_key(|worker| worker.id).cloned()))
-    }
-
     /// Return whether a worker stream is currently registered.
     ///
     /// The activity dispatch path uses this after queuing a task to detect a
@@ -331,6 +313,13 @@ impl ConnectedWorkerRegistry {
                 workers.remove(&worker_id);
                 if workers.is_empty() {
                     state.by_activity.remove(&key);
+                    // Drop the rotation cursor too: with no workers for the key
+                    // the index is dead, and leaving it would let the rotation
+                    // map grow without bound across every activity type the
+                    // server ever serves. A later re-registration restarts the
+                    // rotation from 0, which is acceptable (it already resets on
+                    // restart).
+                    state.rotation.remove(&key);
                 }
             }
         }
@@ -342,6 +331,14 @@ impl ConnectedWorkerRegistry {
         self.inner
             .lock()
             .map_err(|_| ServerError::lock_poisoned("connected worker registry"))
+    }
+
+    /// Number of `(namespace, activity_type)` rotation cursors currently held.
+    /// Test-only: dispatch never reads it, but tests assert the rotation map is
+    /// pruned when a key's workers all deregister.
+    #[cfg(test)]
+    fn rotation_key_count(&self) -> Result<usize, ServerError> {
+        Ok(self.state()?.rotation.len())
     }
 }
 
@@ -474,6 +471,136 @@ mod tests {
 
         tenant_b.deregister()?;
         assert!(registry.workers_for("tenant-b", "charge")?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workers_for_rotates_start_across_calls_with_stable_membership()
+    -> Result<(), ServerError> {
+        let registry = ConnectedWorkerRegistry::default();
+        // Hold the receivers and registrations for the whole test so the
+        // worker senders stay open and the workers stay registered.
+        let mut receivers = Vec::new();
+        let mut registrations = Vec::new();
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            let (tx, rx) = mpsc::channel(1);
+            receivers.push(rx);
+            let registration = registry
+                .accept_registration(
+                    &guard(),
+                    &caller("tenant-a"),
+                    &registration("tenant-a", &["charge"]),
+                    tx,
+                )
+                .await?;
+            ids.push(registration.worker_id());
+            registrations.push(registration);
+        }
+
+        let sorted_membership = {
+            let mut sorted = ids.clone();
+            sorted.sort();
+            sorted
+        };
+
+        let mut starts = Vec::new();
+        for _ in 0..3 {
+            let rotated = registry.workers_for("tenant-a", "charge")?;
+            assert_eq!(rotated.len(), 3, "every call sees all three workers");
+            let mut membership: Vec<Option<WorkerId>> =
+                rotated.iter().map(|worker| Some(worker.id())).collect();
+            membership.sort();
+            assert_eq!(
+                membership, sorted_membership,
+                "membership is stable across rotations"
+            );
+            starts.push(rotated.first().map(WorkerHandle::id));
+        }
+
+        assert_eq!(
+            starts.len(),
+            3,
+            "three calls recorded three starting workers"
+        );
+        let distinct: BTreeSet<_> = starts.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            3,
+            "each successive call starts at a different worker: {starts:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workers_for_stays_in_bounds_after_deregistering_rotation_position()
+    -> Result<(), ServerError> {
+        let registry = ConnectedWorkerRegistry::default();
+        let (tx_a, _rx_a) = mpsc::channel(1);
+        let (tx_b, _rx_b) = mpsc::channel(1);
+        let worker_a = registry
+            .accept_registration(
+                &guard(),
+                &caller("tenant-a"),
+                &registration("tenant-a", &["charge"]),
+                tx_a,
+            )
+            .await?;
+        let worker_b = registry
+            .accept_registration(
+                &guard(),
+                &caller("tenant-a"),
+                &registration("tenant-a", &["charge"]),
+                tx_b,
+            )
+            .await?;
+
+        // Advance the rotation index to the second worker, then deregister the
+        // worker sitting at that index. The next call must wrap the index back
+        // into range rather than index out of bounds.
+        let _ = registry.workers_for("tenant-a", "charge")?;
+        let _ = registry.workers_for("tenant-a", "charge")?;
+        worker_b.deregister()?;
+
+        let remaining = registry.workers_for("tenant-a", "charge")?;
+        assert_eq!(remaining.len(), 1, "only the surviving worker remains");
+        assert_eq!(
+            remaining.first().map(WorkerHandle::id),
+            worker_a.worker_id(),
+            "the surviving worker is returned"
+        );
+        worker_a.deregister()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rotation_cursor_is_pruned_when_last_worker_for_a_key_deregisters()
+    -> Result<(), ServerError> {
+        let registry = ConnectedWorkerRegistry::default();
+        let (tx, _rx) = mpsc::channel(1);
+        let worker = registry
+            .accept_registration(
+                &guard(),
+                &caller("tenant-a"),
+                &registration("tenant-a", &["charge"]),
+                tx,
+            )
+            .await?;
+
+        // Materialise a rotation cursor for the key.
+        let _ = registry.workers_for("tenant-a", "charge")?;
+        assert_eq!(
+            registry.rotation_key_count()?,
+            1,
+            "cursor created for the key"
+        );
+
+        worker.deregister()?;
+        assert_eq!(
+            registry.rotation_key_count()?,
+            0,
+            "the rotation cursor is pruned once the key has no workers"
+        );
         Ok(())
     }
 
